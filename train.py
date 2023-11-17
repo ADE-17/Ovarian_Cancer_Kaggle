@@ -7,11 +7,11 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from trainer import train_classification_model
 
-root = r'C:\Users\ADE17\Desktop\Masters\Projects\Kaggle_UBC_Ocean'
+root = r'/home/woody/iwso/iwso092h/mad_ucb_kaggle'
 train_images = r'train_thumbnails'
-image_folder = r'C:\Users\ADE17\Desktop\Masters\Projects\Kaggle_UBC_Ocean\train_thumbnails'
+image_folder = r'/home/woody/iwso/iwso092h/mad_ucb_kaggle/train_thumbnails'
 
-train_df, val_df = prepare_data.data_split(r'C:\Users\ADE17\Desktop\Masters\Projects\Kaggle_UBC_Ocean\data', )
+train_df, val_df = prepare_data.data_split(r'/home/woody/iwso/iwso092h/mad_ucb_kaggle/data')
 
 train_df_f = prepare_data.preprocess_dataframe(train_df, os.path.join(root, train_images))
 val_df_f = prepare_data.preprocess_dataframe(val_df, os.path.join(root, train_images))

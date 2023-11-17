@@ -24,13 +24,13 @@ class CustomCancerDataset(Dataset):
         image_name = os.path.join(self.image_folder, "{}_thumbnail.png".format(image_ids))
         # print(image_name)
         image = Image.open(image_name)
-        label_CC  = self.metadata_df.label_CC[idx]  
-        label_EC  = self.metadata_df.label_EC[idx]  
-        label_HGSC  = self.metadata_df.label_HGSC[idx]  
-        label_LGSC  = self.metadata_df.label_LGSC[idx]  
-        label_MC  = self.metadata_df.label_MC[idx]  
+        label_CC  = self.metadata_df.label_CC[idx].astype(int)  
+        label_EC  = self.metadata_df.label_EC[idx].astype(int)    
+        label_HGSC  = self.metadata_df.label_HGSC[idx].astype(int)    
+        label_LGSC  = self.metadata_df.label_LGSC[idx].astype(int)    
+        label_MC  = self.metadata_df.label_MC[idx].astype(int)    
         
         if self.transform:
             image = self.transform(image)
 
-        return image, [label_CC, label_EC, label_HGSC, label_LGSC, label_MC]
+        return image, torch.tensor([label_CC, label_EC, label_HGSC, label_LGSC, label_MC], dtype=torch.float)
