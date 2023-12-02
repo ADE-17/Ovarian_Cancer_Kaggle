@@ -4,20 +4,27 @@ from sklearn.model_selection import train_test_split
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from sklearn.metrics import balanced_accuracy_score, accuracy_score
+from sklearn.metrics import balanced_accuracy_score
 import pandas as pd
 import torch
 import torch.nn as nn
 from torchvision import transforms
+import torchvision.models as models
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
+import matplotlib.pyplot as plt
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-import torchvision.models as models
+from efficientnet_pytorch import EfficientNet
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import pytorch_lightning as pl
+import timm
+from pytorch_lightning.callbacks import ModelCheckpoint
+
 
 def get_tiles(img, tile_size=256, n_tiles=30, mode=0):
     h, w, c = img.shape
@@ -68,12 +75,17 @@ def concat_tiles(tiles, n_tiles, image_size):
             img[h1 : h1 + image_size, w1 : w1 + image_size] = this_img
     return img
 
-def to_tensor(x):
-    x = x.astype("float32") / 255
+def sort_tiles_by_intensity(tiles):
+    intensities = np.mean(tiles, axis=(1, 2, 3))  # Calculate mean intensity for each tile
+    
+    sorted_indices = np.argsort(-intensities)
+    
+    sorted_tiles = tiles[sorted_indices]
+    sorted_intensities = intensities[sorted_indices]
+    
+    return sorted_tiles, sorted_intensities, sorted_indices
 
-    return torch.from_numpy(x).permute(2, 0, 1)
-
-class UCBDataset(Dataset):
+class CustomCancerDataset(Dataset):
     def __init__(self, metadata_df, image_folder, transform=None):
         self.metadata_df = metadata_df
         self.image_folder = image_folder
@@ -88,13 +100,19 @@ class UCBDataset(Dataset):
         image = Image.open(image_name)
         img = get_tiles(
             np.array(image),
-            mode=0,
+            mode=0, n_tiles= 64
         )
+        
+        sorted_img = sort_tiles_by_intensity(img)
         img = concat_tiles(
-            img, 16, 256
+            img, 64, 256
         )
 
-        img = to_tensor(img)
+        # img = to_tensor(img)
+        img = Image.fromarray(img)
+        
+        if self.transform:
+            img = self.transform(img)
         
         label_CC  = self.metadata_df.label_CC[idx].astype(int)  
         label_EC  = self.metadata_df.label_EC[idx].astype(int)    
@@ -104,67 +122,60 @@ class UCBDataset(Dataset):
 
         return img, torch.tensor([label_CC, label_EC, label_HGSC, label_LGSC, label_MC], dtype=torch.float)
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, inputs, targets):
-        BCE_loss = nn.BCEWithLogitsLoss(reduction='none')(inputs, targets)
-        pt = torch.exp(-BCE_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
-        return torch.mean(focal_loss)
-    
-def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=10, save_path='model'):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        for inputs, labels in tqdm(train_loader, desc='training:', leave=False):
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels.float())  # Convert labels to float
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_loss = 0.0
-            all_preds = []
-            all_labels = []
-            for inputs, labels in tqdm(val_loader, desc='validating', leave=False):
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)  # Ensure that your loss function matches the task
-                val_loss += loss.item()
-
-                # Calculate predictions
-                _, preds = torch.max(outputs, 1)  # Get the predicted class
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-            # Calculate accuracy or other relevant metrics
-            # val_accuracy = accuracy_score(all_labels, all_preds)
-                    # val_balanced_accuracy = accuracy_score(all_labels, all_preds)
-
-        print(f"Epoch [{epoch+1}/{num_epochs}] "
-              f"Train Loss: {running_loss/len(train_loader):.4f} "
-              f"Val Loss: {val_loss/len(val_loader):.4f} "
-            #   f"Val Balanced Accuracy: {val_accuracy:.4f}"
-                )
-
-        scheduler.step()
+class ViT(pl.LightningModule):
+    def __init__(self, num_classes, image_size=224, backbone='vit_base_patch16_224', finetune_layer=True):
+        super().__init__()
+        self.model = timm.create_model(backbone, pretrained=True)
         
-        if (epoch + 1) % 3 == 0:
-            torch.save(model.state_dict(), f'{save_path}epoch_{epoch+1}_mobile2.pth')
+        if finetune_layer:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            self.model.head = nn.Identity()
+            self.finetune_layer = nn.Sequential(
+                nn.Linear(self.model(torch.randn(1, 3, image_size, image_size)).shape[-1], 512),
+                nn.ReLU(),
+                nn.Linear(512, num_classes)
+            )
+        else:
+            self.model.head = nn.Linear(self.model.head.in_features, num_classes)
+            self.finetune_layer = None
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        
+        if self.finetune_layer is not None:
+            logits = self.finetune_layer(logits)
+
+        loss = F.cross_entropy(logits, y)
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+
+        if self.finetune_layer is not None:
+            logits = self.finetune_layer(logits)
+
+        loss = F.cross_entropy(logits, y)
+        self.log('val_loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        if self.finetune_layer is not None:
+            parameters = list(self.model.parameters()) + list(self.finetune_layer.parameters())
+        else:
+            parameters = self.parameters()
+
+        optimizer = torch.optim.Adam(parameters, lr=1e-4)
+        return optimizer
 
 if __name__ == "__main__":
-
+    
     root = r'/home/woody/iwso/iwso092h/mad_ucb_kaggle'
     train_images = r'train_thumbnails'
     image_folder = r'/home/woody/iwso/iwso092h/mad_ucb_kaggle/train_thumbnails'
@@ -178,25 +189,29 @@ if __name__ == "__main__":
     train_split = train_split.reset_index(drop=True)
     val_split = val_split.reset_index(drop=True)
     
-    train_ucb_dataset = UCBDataset(train_split, image_folder='/home/woody/iwso/iwso092h/mad_ucb_kaggle/train_thumbnails')
-    val_ucb_dataset = UCBDataset(val_split, image_folder='/home/woody/iwso/iwso092h/mad_ucb_kaggle/train_thumbnails')
-    
-    batch_size = 4
-    train_loader = DataLoader(train_ucb_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ucb_dataset, batch_size=batch_size)
-    
-    # model = models.resnet34(pretrained=True)
-    # num_classes = 5  
-    # model.fc = nn.Linear(model.fc.in_features, num_classes)
-    
-    model = models.mobilenet_v2(pretrained=True)
-    num_classes = 5  
-    model.classifier[1] = nn.Linear(model.last_channel, num_classes)
-    
-    criterion = FocalLoss()
+    data_transforms = transforms.Compose([
+        
+        transforms.Resize(224),
+        transforms.ToTensor(),
+    ])
 
-    optimizer = optim.Adam(model.parameters(), lr=0.001)  
-    scheduler = CosineAnnealingLR(optimizer, T_max=10)
+    train_ucb_dataset = CustomCancerDataset(train_split, image_folder='/home/woody/iwso/iwso092h/mad_ucb_kaggle/train_thumbnails',
+                                            transform=data_transforms)
+    val_ucb_dataset = CustomCancerDataset(val_split, image_folder='/home/woody/iwso/iwso092h/mad_ucb_kaggle/train_thumbnails',
+                                      transform=data_transforms)
     
-    model_save_path = '/home/woody/iwso/iwso092h/mad_ucb_kaggle/saved_models/'
-    train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=20, save_path=model_save_path)
+    batch_size = 16
+    train_loader = DataLoader(train_ucb_dataset, batch_size=batch_size, shuffle=True, num_workers=7)
+    val_loader = DataLoader(val_ucb_dataset, batch_size=batch_size, num_workers=7)
+    
+    model = ViT(num_classes=5, finetune_layer=True)
+
+    checkpoint_callback = ModelCheckpoint(
+    dirpath='/home/woody/iwso/iwso092h/mad_ucb_kaggle/saved_models',  # Directory to save the checkpoints
+    filename='vit-{epoch:02d}-{val_loss:.4f}',
+    save_top_k=1,  # Save the best model based on the lowest validation loss
+    mode='min'
+    )
+    trainer = pl.Trainer(max_epochs=15, log_every_n_steps=15,
+                         callbacks=[checkpoint_callback])  
+    trainer.fit(model, train_loader, val_loader)
